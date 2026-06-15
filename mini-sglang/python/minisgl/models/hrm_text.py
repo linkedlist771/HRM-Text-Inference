@@ -26,18 +26,23 @@ if TYPE_CHECKING:
 class HrmRMSNorm(BaseOP):
     """Parameterless Pre-RMSNorm (no learnable weight), computed in float32.
 
-    Matches transformers ``HrmTextRMSNorm`` exactly. It owns no tensors, so it
+    Matches transformers ``HrmTextRMSNorm`` exactly. It owns no public tensors, so it
     contributes nothing to the state dict — the HRM checkpoint has no norm weights.
     """
 
     def __init__(self, eps: float) -> None:
+        from flashinfer import rmsnorm
+
         self._eps = eps
+        self._rmsnorm = rmsnorm
+        self._weight: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self._eps)
-        return x.to(dtype)
+        weight = self._weight
+        if weight is None or weight.device != x.device or weight.dtype != x.dtype:
+            weight = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
+            self._weight = weight
+        return self._rmsnorm(x, weight, self._eps)
 
 
 class HrmAttention(BaseOP):
