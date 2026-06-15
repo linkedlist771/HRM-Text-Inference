@@ -219,3 +219,7 @@ __marimo__/
 
 uv.lock
 checkpoints
+# session run artifacts
+server.log
+ref_*.txt
+bench_out.txt
