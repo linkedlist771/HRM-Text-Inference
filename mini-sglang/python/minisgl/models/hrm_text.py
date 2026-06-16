@@ -104,6 +104,51 @@ def _state_add_rmsnorm(state: torch.Tensor, update: torch.Tensor, eps: float) ->
     return out
 
 
+@triton.jit
+def _store_kv_kernel(
+    k_cache,
+    v_cache,
+    indices,
+    k,
+    v,
+    n_elems: tl.constexpr,
+    k_stride0: tl.constexpr,
+    v_stride0: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    token = tl.program_id(0)
+    block = tl.program_id(1)
+    offs = block * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elems
+    dst = tl.load(indices + token).to(tl.int64) * n_elems + offs
+    k_src = token * k_stride0 + offs
+    v_src = token * v_stride0 + offs
+    tl.store(k_cache + dst, tl.load(k + k_src, mask=mask), mask=mask)
+    tl.store(v_cache + dst, tl.load(v + v_src, mask=mask), mask=mask)
+
+
+def _store_kv_triton(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> None:
+    n_elems = k.shape[1]
+    _store_kv_kernel[(k.shape[0], triton.cdiv(n_elems, 128))](
+        k_cache,
+        v_cache,
+        indices,
+        k,
+        v,
+        n_elems,
+        k.stride(0),
+        v.stride(0),
+        BLOCK=128,
+        num_warps=4,
+    )
+
+
 class HrmRMSNorm(BaseOP):
     """Parameterless Pre-RMSNorm (no learnable weight).
 
@@ -195,7 +240,18 @@ class HrmAttention(BaseOP):
         # (same as minisgl's stock RopeAttn), avoiding 3 clone copies per attention.
         q, k = self._rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self._num_qo_heads, self._head_dim)
-        o = ctx.attn_backend.forward(q, k, v, cycle_offset + self._layer_idx, ctx.batch)
+        backend = ctx.attn_backend
+        metadata = ctx.batch.attn_metadata
+        backend._initialize_metadata_once(metadata)
+        layer_id = cycle_offset + self._layer_idx
+        k_cache = backend.kvcache.k_cache(layer_id)
+        v_cache = backend.kvcache.v_cache(layer_id)
+        _store_kv_triton(k_cache, v_cache, ctx.batch.out_loc, k, v)
+        kv_cache = (
+            k_cache.view(-1, 1, k_cache.shape[2], k_cache.shape[3]),
+            v_cache.view(-1, 1, v_cache.shape[2], v_cache.shape[3]),
+        )
+        o = metadata.wrapper.run(q=q, paged_kv_cache=kv_cache)
         o = o.view(-1, self._qo_dim)
         o = _sigmoid_mul(gate, o)
         return self.o_proj.forward(o)
