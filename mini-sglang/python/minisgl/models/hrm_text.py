@@ -72,17 +72,29 @@ class HrmRMSNorm(BaseOP):
     """
 
     def __init__(self, eps: float) -> None:
-        from flashinfer import rmsnorm
+        from flashinfer import fused_add_rmsnorm, rmsnorm
 
         self._eps = eps
+        self._fused_add_rmsnorm = fused_add_rmsnorm
         self._rmsnorm = rmsnorm
         self._weight: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _get_weight(self, x: torch.Tensor) -> torch.Tensor:
         w = self._weight
         if w is None or w.device != x.device or w.dtype != x.dtype:
             w = self._weight = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
+        return w
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        w = self._get_weight(x)
         return self._rmsnorm(x, w, self._eps)
+
+    def forward_after_residual_add(
+        self, x: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        w = self._get_weight(x)
+        self._fused_add_rmsnorm(x, residual, w, self._eps)
+        return x, residual
 
 
 class HrmAttention(BaseOP):
@@ -153,10 +165,7 @@ class HrmDecoderLayer(BaseOP):
         residual = x
         x = self.input_layernorm.forward(x)
         x = self.attn.forward(x, cycle_offset)
-        x = residual + x
-
-        residual = x
-        x = self.post_attention_layernorm.forward(x)
+        x, residual = self.post_attention_layernorm.forward_after_residual_add(x, residual)
         x = self.mlp.forward(x)
         x = residual + x
         return x
