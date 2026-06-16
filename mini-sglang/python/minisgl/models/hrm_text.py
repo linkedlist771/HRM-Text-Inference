@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+import triton
+import triton.language as tl
 from minisgl.core import get_global_ctx
 from minisgl.distributed import get_tp_info
 from minisgl.layers import (
@@ -21,6 +23,43 @@ from .utils import GatedMLP
 
 if TYPE_CHECKING:
     from .config import ModelConfig
+
+
+@triton.jit
+def _sigmoid_mul_kernel(
+    gate,
+    x,
+    out,
+    n_cols: tl.constexpr,
+    gate_stride0: tl.constexpr,
+    x_stride0: tl.constexpr,
+    out_stride0: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    cols = block * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    gate_vals = tl.load(gate + row * gate_stride0 + cols, mask=mask, other=0.0).to(tl.float32)
+    x_vals = tl.load(x + row * x_stride0 + cols, mask=mask, other=0.0)
+    scale = 1.0 / (1.0 + tl.exp(-gate_vals))
+    tl.store(out + row * out_stride0 + cols, x_vals * scale, mask=mask)
+
+
+def _sigmoid_mul(gate: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    _sigmoid_mul_kernel[(gate.shape[0], triton.cdiv(gate.shape[1], 1024))](
+        gate,
+        x,
+        out,
+        gate.shape[1],
+        gate.stride(0),
+        x.stride(0),
+        out.stride(0),
+        BLOCK=1024,
+        num_warps=4,
+    )
+    return out
 
 
 class HrmRMSNorm(BaseOP):
@@ -99,7 +138,7 @@ class HrmAttention(BaseOP):
         q = q.view(-1, self._num_qo_heads, self._head_dim)
         o = ctx.attn_backend.forward(q, k, v, cycle_offset + self._layer_idx, ctx.batch)
         o = o.view(-1, self._qo_dim)
-        o = torch.sigmoid(gate) * o
+        o = _sigmoid_mul(gate, o)
         return self.o_proj.forward(o)
 
 
