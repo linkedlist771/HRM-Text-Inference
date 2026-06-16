@@ -62,6 +62,48 @@ def _sigmoid_mul(gate: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@triton.jit
+def _state_add_rmsnorm_kernel(
+    state,
+    update,
+    out,
+    n_cols: tl.constexpr,
+    state_stride0: tl.constexpr,
+    update_stride0: tl.constexpr,
+    out_stride0: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    state_vals = tl.load(state + row * state_stride0 + cols, mask=mask, other=0.0).to(tl.float32)
+    update_vals = tl.load(update + row * update_stride0 + cols, mask=mask, other=0.0).to(tl.float32)
+    raw = (state_vals + update_vals).to(tl.bfloat16)
+    raw_f32 = raw.to(tl.float32)
+    mean_square = tl.sum(raw_f32 * raw_f32, axis=0) / n_cols
+    scale = tl.rsqrt(mean_square + eps)
+    tl.store(state + row * state_stride0 + cols, raw, mask=mask)
+    tl.store(out + row * out_stride0 + cols, raw_f32 * scale, mask=mask)
+
+
+def _state_add_rmsnorm(state: torch.Tensor, update: torch.Tensor, eps: float) -> torch.Tensor:
+    out = torch.empty_like(state)
+    _state_add_rmsnorm_kernel[(state.shape[0],)](
+        state,
+        update,
+        out,
+        state.shape[1],
+        state.stride(0),
+        update.stride(0),
+        out.stride(0),
+        eps,
+        BLOCK=2048,
+        num_warps=8,
+    )
+    return out
+
+
 class HrmRMSNorm(BaseOP):
     """Parameterless Pre-RMSNorm (no learnable weight).
 
@@ -95,6 +137,11 @@ class HrmRMSNorm(BaseOP):
         w = self._get_weight(x)
         self._fused_add_rmsnorm(x, residual, w, self._eps)
         return x, residual
+
+    def forward_after_state_add(
+        self, state: torch.Tensor, update: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _state_add_rmsnorm(state, update, self._eps), state
 
 
 class HrmAttention(BaseOP):
@@ -229,14 +276,12 @@ class HrmModel(BaseOP):
         for h in range(self._H_cycles):
             for l in range(self._L_cycles):
                 offset = (h * (self._L_cycles + 1) + l) * nps
-                z_L = z_L + z_H
-                normed = self._L_layers[0].input_layernorm.forward(z_L)
+                normed, z_L = self._L_layers[0].input_layernorm.forward_after_state_add(z_L, z_H)
                 for layer, next_norm in self._L_layer_norm_pairs:
                     normed, z_L = layer.forward_normed(normed, z_L, offset, next_norm)
                 z_L = normed
             offset = (h * (self._L_cycles + 1) + self._L_cycles) * nps
-            z_H = z_H + z_L
-            normed = self._H_layers[0].input_layernorm.forward(z_H)
+            normed, z_H = self._H_layers[0].input_layernorm.forward_after_state_add(z_H, z_L)
             for layer, next_norm in self._H_layer_norm_pairs:
                 normed, z_H = layer.forward_normed(normed, z_H, offset, next_norm)
             z_H = normed
