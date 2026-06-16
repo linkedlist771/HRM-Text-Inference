@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import gc
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Callable, Dict, List
 
 import torch
 from minisgl.core import Batch, Req, get_global_ctx
@@ -88,6 +88,7 @@ class GraphRunner:
         max_seq_len: int,
         vocab_size: int,
         dummy_req: Req,
+        forward_fn: Callable[[], torch.Tensor] | None = None,
     ) -> None:
         cuda_graph_bs = _determine_cuda_graph_bs(
             cuda_graph_bs=cuda_graph_bs,
@@ -100,6 +101,7 @@ class GraphRunner:
         self.dummy_req = dummy_req
         self.stream = stream
         self.device = device
+        self.forward_fn = forward_fn if forward_fn is not None else model.forward
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _capture_graphs(self, max_seq_len: int, vocab_size: int, model: BaseLLMModel):
@@ -136,9 +138,12 @@ class GraphRunner:
             self.attn_backend.prepare_for_capture(batch)
             self.buffer.set_batch(batch)
             with get_global_ctx().forward_batch(batch):
-                self.buffer.logits[:bs] = model.forward()
+                # Warm up twice so torch.compile fully specializes this shape and its
+                # guards settle *before* capture (recompiling inside capture would error).
+                self.buffer.logits[:bs] = self.forward_fn()
+                self.buffer.logits[:bs] = self.forward_fn()
                 with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
+                    self.buffer.logits[:bs] = self.forward_fn()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             self.graph_map[bs] = graph

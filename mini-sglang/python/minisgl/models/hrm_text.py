@@ -24,10 +24,12 @@ if TYPE_CHECKING:
 
 
 class HrmRMSNorm(BaseOP):
-    """Parameterless Pre-RMSNorm (no learnable weight), computed in float32.
+    """Parameterless Pre-RMSNorm (no learnable weight).
 
-    Matches transformers ``HrmTextRMSNorm`` exactly. It owns no public tensors, so it
-    contributes nothing to the state dict — the HRM checkpoint has no norm weights.
+    Matches transformers ``HrmTextRMSNorm``. Uses flashinfer's fused rmsnorm kernel
+    (one launch instead of ~6 eager pow/mean/rsqrt/cast/mul ops) with an all-ones
+    weight — the HRM checkpoint has no norm weights. The ones weight is built lazily
+    (underscore attr) so it stays out of the state dict.
     """
 
     def __init__(self, eps: float) -> None:
@@ -38,11 +40,10 @@ class HrmRMSNorm(BaseOP):
         self._weight: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        weight = self._weight
-        if weight is None or weight.device != x.device or weight.dtype != x.dtype:
-            weight = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
-            self._weight = weight
-        return self._rmsnorm(x, weight, self._eps)
+        w = self._weight
+        if w is None or w.device != x.device or w.dtype != x.dtype:
+            w = self._weight = torch.ones(x.shape[-1], device=x.device, dtype=x.dtype)
+        return self._rmsnorm(x, w, self._eps)
 
 
 class HrmAttention(BaseOP):
@@ -92,7 +93,8 @@ class HrmAttention(BaseOP):
         gate, q, k, v = gqkv.split(
             [self._qo_dim, self._qo_dim, self._kv_dim, self._kv_dim], dim=-1
         )
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        # No .contiguous(): flashinfer rope / KV-store accept the strided split views
+        # (same as minisgl's stock RopeAttn), avoiding 3 clone copies per attention.
         q, k = self._rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self._num_qo_heads, self._head_dim)
         o = ctx.attn_backend.forward(q, k, v, cycle_offset + self._layer_idx, ctx.batch)
@@ -149,12 +151,8 @@ class HrmModel(BaseOP):
         self._H_cycles = config.H_cycles
         self._L_cycles = config.L_cycles
         self._num_layers_per_stack = config.num_layers_per_stack
-        self._compiled_forward = torch.compile(self._forward_impl, mode="reduce-overhead")
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self._compiled_forward(input_ids)
-
-    def _forward_impl(self, input_ids: torch.Tensor) -> torch.Tensor:
         # z_H: slow / high-level state. z_L: fast / low-level state (init = 0).
         z_H = self.embed_tokens.forward(input_ids) * self._embedding_scale
         z_L = torch.zeros_like(z_H)

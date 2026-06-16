@@ -224,4 +224,5 @@ server.log
 ref_*.txt
 bench_out.txt
 
-.omc
+.omchf_bench.txt
+ms_bench.txt

@@ -51,6 +51,16 @@ class Engine:
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
+        # Optionally torch.compile the forward. Used for the (static-shape) decode
+        # path captured into CUDA graphs, so the fused kernels are baked into each
+        # replayed graph. Prefill stays eager (dynamic shapes -> avoid recompiles).
+        self.compiled_forward = self.model.forward
+        if config.enable_torch_compile:
+            logger.info_rank0(f"torch.compile enabled (mode={config.torch_compile_mode})")
+            self.compiled_forward = torch.compile(
+                self.model.forward, dynamic=False, fullgraph=False, mode=config.torch_compile_mode
+            )
+
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
@@ -100,6 +110,7 @@ class Engine:
             stream=self.stream,
             device=self.device,
             model=self.model,
+            forward_fn=self.compiled_forward,
             attn_backend=self.attn_backend,
             cuda_graph_bs=config.cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,

@@ -29,6 +29,8 @@ class EngineConfig:
     use_pynccl: bool = True
     max_seq_len_override: int | None = None
     num_page_override: int | None = None  # if not None, will override the number of pages
+    enable_torch_compile: bool = False  # torch.compile the decode forward (fused into CUDA graphs)
+    torch_compile_mode: str = "default"
 
     @cached_property
     def hf_config(self):
