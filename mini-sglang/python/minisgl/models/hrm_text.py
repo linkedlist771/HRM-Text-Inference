@@ -104,6 +104,24 @@ def _state_add_rmsnorm(state: torch.Tensor, update: torch.Tensor, eps: float) ->
     return out
 
 
+def _residual_add_rmsnorm(
+    x: torch.Tensor, residual: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _state_add_rmsnorm_kernel[(residual.shape[0],)](
+        residual,
+        x,
+        x,
+        residual.shape[1],
+        residual.stride(0),
+        x.stride(0),
+        x.stride(0),
+        eps,
+        BLOCK=2048,
+        num_warps=8,
+    )
+    return x, residual
+
+
 @triton.jit
 def _rope_store_kv_kernel(
     q,
@@ -194,10 +212,9 @@ class HrmRMSNorm(BaseOP):
     """
 
     def __init__(self, eps: float) -> None:
-        from flashinfer import fused_add_rmsnorm, rmsnorm
+        from flashinfer import rmsnorm
 
         self._eps = eps
-        self._fused_add_rmsnorm = fused_add_rmsnorm
         self._rmsnorm = rmsnorm
         self._weight: torch.Tensor | None = None
 
@@ -214,9 +231,7 @@ class HrmRMSNorm(BaseOP):
     def forward_after_residual_add(
         self, x: torch.Tensor, residual: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        w = self._get_weight(x)
-        self._fused_add_rmsnorm(x, residual, w, self._eps)
-        return x, residual
+        return _residual_add_rmsnorm(x, residual, self._eps)
 
     def forward_after_state_add(
         self, state: torch.Tensor, update: torch.Tensor
