@@ -105,47 +105,82 @@ def _state_add_rmsnorm(state: torch.Tensor, update: torch.Tensor, eps: float) ->
 
 
 @triton.jit
-def _store_kv_kernel(
+def _rope_store_kv_kernel(
+    q,
+    k,
+    v,
     k_cache,
     v_cache,
     indices,
-    k,
-    v,
-    n_elems: tl.constexpr,
+    positions,
+    cos_sin_cache,
+    q_stride0: tl.constexpr,
     k_stride0: tl.constexpr,
     v_stride0: tl.constexpr,
-    BLOCK: tl.constexpr,
+    cos_sin_stride0: tl.constexpr,
+    n_elems: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HALF: tl.constexpr,
 ) -> None:
     token = tl.program_id(0)
-    block = tl.program_id(1)
-    offs = block * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n_elems
-    dst = tl.load(indices + token).to(tl.int64) * n_elems + offs
-    k_src = token * k_stride0 + offs
-    v_src = token * v_stride0 + offs
-    tl.store(k_cache + dst, tl.load(k + k_src, mask=mask), mask=mask)
-    tl.store(v_cache + dst, tl.load(v + v_src, mask=mask), mask=mask)
+    head = tl.program_id(1)
+    offs = tl.arange(0, HALF)
+
+    pos = tl.load(positions + token).to(tl.int64)
+    cos = tl.load(cos_sin_cache + pos * cos_sin_stride0 + offs).to(tl.float32)
+    sin = tl.load(cos_sin_cache + pos * cos_sin_stride0 + HALF + offs).to(tl.float32)
+
+    head_offs = head * HEAD_DIM
+    q_base = q + token * q_stride0 + head_offs
+    k_base = k + token * k_stride0 + head_offs
+    v_base = v + token * v_stride0 + head_offs
+
+    q0 = tl.load(q_base + offs).to(tl.float32)
+    q1 = tl.load(q_base + HALF + offs).to(tl.float32)
+    tl.store(q_base + offs, q0 * cos - q1 * sin)
+    tl.store(q_base + HALF + offs, q1 * cos + q0 * sin)
+
+    k0 = tl.load(k_base + offs).to(tl.float32)
+    k1 = tl.load(k_base + HALF + offs).to(tl.float32)
+    k_rot0 = k0 * cos - k1 * sin
+    k_rot1 = k1 * cos + k0 * sin
+
+    dst = tl.load(indices + token).to(tl.int64) * n_elems + head_offs
+    tl.store(k_cache + dst + offs, k_rot0)
+    tl.store(k_cache + dst + HALF + offs, k_rot1)
+    tl.store(v_cache + dst + offs, tl.load(v_base + offs))
+    tl.store(v_cache + dst + HALF + offs, tl.load(v_base + HALF + offs))
 
 
-def _store_kv_triton(
+def _rope_store_kv(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     indices: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_dim: int,
 ) -> None:
     n_elems = k.shape[1]
-    _store_kv_kernel[(k.shape[0], triton.cdiv(n_elems, 128))](
+    _rope_store_kv_kernel[(k.shape[0], triton.cdiv(n_elems, head_dim))](
+        q,
+        k,
+        v,
         k_cache,
         v_cache,
         indices,
-        k,
-        v,
-        n_elems,
+        positions,
+        cos_sin_cache,
+        q.stride(0),
         k.stride(0),
         v.stride(0),
-        BLOCK=128,
-        num_warps=4,
+        cos_sin_cache.stride(0),
+        n_elems,
+        HEAD_DIM=head_dim,
+        HALF=head_dim // 2,
+        num_warps=2,
     )
 
 
@@ -236,17 +271,24 @@ class HrmAttention(BaseOP):
         gate, q, k, v = gqkv.split(
             [self._qo_dim, self._qo_dim, self._kv_dim, self._kv_dim], dim=-1
         )
-        # No .contiguous(): flashinfer rope / KV-store accept the strided split views
-        # (same as minisgl's stock RopeAttn), avoiding 3 clone copies per attention.
-        q, k = self._rotary.forward(ctx.batch.positions, q, k)
-        q = q.view(-1, self._num_qo_heads, self._head_dim)
         backend = ctx.attn_backend
         metadata = ctx.batch.attn_metadata
         backend._initialize_metadata_once(metadata)
         layer_id = cycle_offset + self._layer_idx
         k_cache = backend.kvcache.k_cache(layer_id)
         v_cache = backend.kvcache.v_cache(layer_id)
-        _store_kv_triton(k_cache, v_cache, ctx.batch.out_loc, k, v)
+        _rope_store_kv(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            ctx.batch.out_loc,
+            ctx.batch.positions,
+            self._rotary._cos_sin_cache,
+            self._head_dim,
+        )
+        q = q.view(-1, self._num_qo_heads, self._head_dim)
         kv_cache = (
             k_cache.view(-1, 1, k_cache.shape[2], k_cache.shape[3]),
             v_cache.view(-1, 1, v_cache.shape[2], v_cache.shape[3]),
