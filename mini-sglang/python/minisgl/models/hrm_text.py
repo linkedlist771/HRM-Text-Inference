@@ -100,6 +100,7 @@ def _state_add_rmsnorm(state: torch.Tensor, update: torch.Tensor, eps: float) ->
         eps,
         BLOCK=2048,
         num_warps=4,
+        num_stages=1,
     )
     return out
 
@@ -118,6 +119,7 @@ def _residual_add_rmsnorm(
         eps,
         BLOCK=2048,
         num_warps=4,
+        num_stages=1,
     )
     return x, residual
 
