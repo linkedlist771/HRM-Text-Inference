@@ -50,14 +50,45 @@ backend · CUDA graphs (bs ≤ 64) · 12 288-token KV cache · 64 output tokens/
 
 | Concurrency | Requests | Failures | TTFT avg | TTFT p99 | TPOT avg | TPOT p99 | E2E avg | Output tok/s | Req/s |
 |---|---|---|---|---|---|---|---|---|---|
-| 1  | 32  | 0 | 32.7 ms | 34.0 ms  | 13.6 ms | 13.7 ms | 0.88 s | 72   | 1.14  |
-| 8  | 32  | 0 | 37.0 ms | 37.8 ms  | 16.0 ms | 16.1 ms | 1.03 s | 488  | 7.75  |
-| 32 | 128 | 0 | 58.1 ms | 61.2 ms  | 17.5 ms | 17.5 ms | 1.14 s | 1761 | 27.95 |
-| 64 | 256 | 0 | 99.8 ms | 111.5 ms | 19.9 ms | 20.0 ms | 1.34 s | 3007 | 47.72 |
+| 1  | 48  | 0 | 27.5 ms | 64.5 ms | 11.6 ms | 11.7 ms | 0.75 s | 84   | 1.34  |
+| 8  | 48  | 0 | 29.4 ms | 30.1 ms | 13.3 ms | 13.4 ms | 0.86 s | 588  | 9.33  |
+| 32 | 128 | 0 | 48.9 ms | 51.6 ms | 14.5 ms | 14.6 ms | 0.95 s | 2117 | 33.61 |
+| 64 | 256 | 0 | 80.0 ms | 94.0 ms | 17.1 ms | 17.3 ms | 1.14 s | 3517 | 55.82 |
 
-Output throughput scales to **~3 000 tok/s** at concurrency 64 while TPOT stays ~14–20 ms and
-TTFT degrades gracefully — **0 failures** across all scenarios. (CUDA graphs cut TPOT from
-~39 ms to ~14 ms vs. eager decode.)
+Output throughput scales to **~3 500 tok/s** at concurrency 64 while TPOT stays ~12–17 ms and
+TTFT degrades gracefully — **0 failures** across all scenarios.
+
+### Speeding up inference (CUDA graphs · profiling · torch.compile)
+
+**CUDA graphs** are the biggest win: the recurrent HRM forward issues ~128 attention + 128 MLP
+calls *per token*, so eager decode is dominated by kernel-launch overhead. Capturing decode into
+CUDA graphs (`--cuda-graph-max-bs N`, on by default) cut TPOT from ~39 ms to ~14 ms.
+
+**Profiler-driven optimization.** Profiling one decode run with graphs *and* compile disabled
+(`profile_decode.py`, so nothing hides the real per-op cost) showed the eager path was
+**launch-bound** (CPU 1.94 s vs CUDA 1.07 s) and that the parameterless RMSNorm alone was ~6
+eager ops (`pow`/`mean`/`rsqrt`/cast/`mul`) × 16.9 k calls, plus my attention `.contiguous()`
+copies cost another ~40 ms / 24.6 k clones. Two fixes — a fused flashinfer `rmsnorm` (all-ones
+weight) and dropping the redundant `.contiguous()` — gave:
+
+| | Self CPU | Self CUDA | `copy_` calls |
+|---|---|---|---|
+| before | 1.94 s | 1.07 s | 67.5 k |
+| after  | **0.875 s** (−55 %) | **0.863 s** (−19 %) | **9.2 k** |
+
+This also lifted the CUDA-graph decode path: TPOT 13.6→11.6 ms (c=1), throughput 3007→**3517**
+tok/s (c=64) — and parity is unchanged (still 33 matching tokens vs. HF).
+
+**torch.compile** (`--enable-torch-compile`) is wired in and composes with CUDA graphs (the
+compiled, fused kernels are captured into each graph). For *this* model it is **slower** and left
+off by default — a measured A/B (graph-bs 32) shows why: the forward is dominated by tiny cuBLAS
+GEMMs (Inductor can't beat them) and flashinfer custom ops (128 graph breaks), so there is little
+left to fuse and the breaks add overhead.
+
+| graph-bs 32 | c=1 TPOT | c=8 TPOT | c=32 TPOT | c=32 tok/s |
+|---|---|---|---|---|
+| CUDA graphs only        | **11.6 ms** | **13.3 ms** | **14.6 ms** | **2102** |
+| + torch.compile         | 19.7 ms | 22.9 ms | 23.3 ms | 1339 |
 
 A correctness/robustness stress test is also provided:
 

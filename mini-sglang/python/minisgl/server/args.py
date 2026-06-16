@@ -218,6 +218,20 @@ def parse_args(args: List[str], run_shell: bool = False) -> Tuple[ServerArgs, bo
     )
 
     parser.add_argument(
+        "--enable-torch-compile",
+        action="store_true",
+        dest="enable_torch_compile",
+        help="torch.compile the decode forward; fused kernels are baked into the CUDA graphs.",
+    )
+
+    parser.add_argument(
+        "--torch-compile-mode",
+        type=str,
+        default=ServerArgs.torch_compile_mode,
+        help="torch.compile mode (e.g. default, max-autotune-no-cudagraphs).",
+    )
+
+    parser.add_argument(
         "--shell-mode",
         action="store_true",
         help="Run the server in shell mode.",
