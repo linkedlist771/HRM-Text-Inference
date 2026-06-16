@@ -161,13 +161,22 @@ class HrmDecoderLayer(BaseOP):
         self.input_layernorm = HrmRMSNorm(config.rms_norm_eps)
         self.post_attention_layernorm = HrmRMSNorm(config.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor, cycle_offset: int) -> torch.Tensor:
-        residual = x
-        x = self.input_layernorm.forward(x)
+    def forward_normed(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        cycle_offset: int,
+        output_norm: HrmRMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         x = self.attn.forward(x, cycle_offset)
         x, residual = self.post_attention_layernorm.forward_after_residual_add(x, residual)
         x = self.mlp.forward(x)
-        x = residual + x
+        return output_norm.forward_after_residual_add(x, residual)
+
+    def forward(self, x: torch.Tensor, cycle_offset: int) -> torch.Tensor:
+        residual = x
+        x = self.input_layernorm.forward(x)
+        _, x = self.forward_normed(x, residual, cycle_offset, self.input_layernorm)
         return x
 
 
@@ -179,11 +188,16 @@ class HrmStack(BaseOP):
             [HrmDecoderLayer(config, i) for i in range(config.num_layers_per_stack)]
         )
         self.final_norm = HrmRMSNorm(config.rms_norm_eps)
+        layers = self.layers.op_list
+        self._layer_norm_pairs = tuple(
+            zip(layers, [layer.input_layernorm for layer in layers[1:]] + [self.final_norm])
+        )
 
     def forward(self, x: torch.Tensor, cycle_offset: int) -> torch.Tensor:
-        for layer in self.layers.op_list:
-            x = layer.forward(x, cycle_offset)
-        return self.final_norm.forward(x)
+        normed = self.layers.op_list[0].input_layernorm.forward(x)
+        for layer, next_norm in self._layer_norm_pairs:
+            normed, x = layer.forward_normed(normed, x, cycle_offset, next_norm)
+        return normed
 
 
 class HrmModel(BaseOP):
@@ -203,6 +217,8 @@ class HrmModel(BaseOP):
         self._H_layers = self.H_module.layers.op_list
         self._L_final_norm = self.L_module.final_norm
         self._H_final_norm = self.H_module.final_norm
+        self._L_layer_norm_pairs = self.L_module._layer_norm_pairs
+        self._H_layer_norm_pairs = self.H_module._layer_norm_pairs
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # z_H: slow / high-level state. z_L: fast / low-level state (init = 0).
@@ -214,14 +230,16 @@ class HrmModel(BaseOP):
             for l in range(self._L_cycles):
                 offset = (h * (self._L_cycles + 1) + l) * nps
                 z_L = z_L + z_H
-                for layer in self._L_layers:
-                    z_L = layer.forward(z_L, offset)
-                z_L = self._L_final_norm.forward(z_L)
+                normed = self._L_layers[0].input_layernorm.forward(z_L)
+                for layer, next_norm in self._L_layer_norm_pairs:
+                    normed, z_L = layer.forward_normed(normed, z_L, offset, next_norm)
+                z_L = normed
             offset = (h * (self._L_cycles + 1) + self._L_cycles) * nps
             z_H = z_H + z_L
-            for layer in self._H_layers:
-                z_H = layer.forward(z_H, offset)
-            z_H = self._H_final_norm.forward(z_H)
+            normed = self._H_layers[0].input_layernorm.forward(z_H)
+            for layer, next_norm in self._H_layer_norm_pairs:
+                normed, z_H = layer.forward_normed(normed, z_H, offset, next_norm)
+            z_H = normed
         return z_H
 
 
