@@ -48,7 +48,7 @@ def _sigmoid_mul_kernel(
 
 def _sigmoid_mul(gate: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
-    _sigmoid_mul_kernel[(gate.shape[0], triton.cdiv(gate.shape[1], 1024))](
+    _sigmoid_mul_kernel[(gate.shape[0], triton.cdiv(gate.shape[1], 512))](
         gate,
         x,
         out,
@@ -56,7 +56,7 @@ def _sigmoid_mul(gate: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         gate.stride(0),
         x.stride(0),
         out.stride(0),
-        BLOCK=1024,
+        BLOCK=512,
         num_warps=1,
     )
     return out
