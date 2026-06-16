@@ -157,33 +157,36 @@ class FrontendManager:
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)
 
-    async def stream_chat_completions(self, uid: int):
+    async def stream_chat_completions(self, uid: int, model: str = ""):
+        created = int(time.time())
+        cmpl_id = f"chatcmpl-{uid}"
+
+        def _chunk(delta: dict, finish_reason: str | None) -> bytes:
+            payload = {
+                "id": cmpl_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            }
+            return f"data: {json.dumps(payload)}\n\n".encode()
+
         first_chunk = True
         async for ack in self.wait_for_ack(uid):
-            delta = {}
+            delta: Dict[str, str] = {}
             if first_chunk:
                 delta["role"] = "assistant"
                 first_chunk = False
             if ack.incremental_output:
                 delta["content"] = ack.incremental_output
 
-            chunk = {
-                "id": f"cmpl-{uid}",
-                "object": "text_completion.chunk",
-                "choices": [{"delta": delta, "index": 0, "finish_reason": None}],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n".encode()
+            yield _chunk(delta, None)
 
             if ack.finished:
                 break
 
-        # send final finish_reason
-        end_chunk = {
-            "id": f"cmpl-{uid}",
-            "object": "text_completion.chunk",
-            "choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}],
-        }
-        yield f"data: {json.dumps(end_chunk)}\n\n".encode()
+        # final chunk carries the finish_reason, then the SSE terminator
+        yield _chunk({}, "stop")
         yield b"data: [DONE]\n\n"
         logger.debug("Finished streaming response for user %s", uid)
 
@@ -279,14 +282,18 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
 
     if req.stream:
         return StreamingResponse(
-            state.stream_with_cancellation(state.stream_chat_completions(uid), request, uid),
+            state.stream_with_cancellation(
+                state.stream_chat_completions(uid, req.model), request, uid
+            ),
             media_type="text/event-stream",
         )
 
     # Non-streaming: collect all chunks and return a single JSON response
     full_content = ""
+    completion_tokens = 0
     async for ack in state.wait_for_ack(uid):
         full_content += ack.incremental_output
+        completion_tokens += 1  # one detokenizer reply per generated token
         if ack.finished:
             break
 
@@ -299,13 +306,14 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             {
                 "index": 0,
                 "message": {"role": "assistant", "content": full_content},
+                "logprobs": None,
                 "finish_reason": "stop",
             }
         ],
         "usage": {
             "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
+            "completion_tokens": completion_tokens,
+            "total_tokens": completion_tokens,
         },
     }
 

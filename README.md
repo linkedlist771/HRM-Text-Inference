@@ -104,21 +104,41 @@ python stress_test.py --num-requests 300 --concurrency 64 --max-tokens 128
 export PYTHONPATH=$PWD/mini-sglang/python
 export CUDA_HOME=/usr/local/cuda-12.4 PATH=/usr/local/cuda-12.4/bin:$PATH TORCH_CUDA_ARCH_LIST=8.9
 
-python -m minisgl \
-  --model-path checkpoints/HRM-Text-1B \
-  --attention-backend fi --cache-type naive --dtype bfloat16 \
-  --host 127.0.0.1 --port 1919 --cuda-graph-max-bs 64
+./run_server.sh   # best-known config; see the script header for env overrides
+```
 
-# query (raw prompt; the HRM checkpoint has no chat template)
+`/v1/chat/completions` is compatible with the **official OpenAI Python SDK** (non-streaming and
+streaming, via `messages`). Since the HRM checkpoint ships no chat template, the server falls
+back to a minimal `<|im_start|>…<|im_end|>` envelope:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:1919/v1", api_key="not-needed")
+
+r = client.chat.completions.create(
+    model="hrm",
+    messages=[{"role": "user", "content": "9.8 and 9.11, which is bigger?"}],
+    max_tokens=128, temperature=0.0,
+)
+print(r.choices[0].message.content)
+
+for chunk in client.chat.completions.create(model="hrm", stream=True,
+        messages=[{"role": "user", "content": "Explain why the sky is blue."}], max_tokens=128):
+    print(chunk.choices[0].delta.content or "", end="")
+```
+
+For best HRM prompting you can instead pass the raw `prompt` field with a condition prefix
+(`synth,cot` → `<|quad_end|><|object_ref_end|>`), exactly as `hf_inference.py` does:
+
+```bash
 curl -s http://127.0.0.1:1919/v1/chat/completions -H 'Content-Type: application/json' -d '{
   "model":"hrm",
   "prompt":"<|im_start|><|quad_end|><|object_ref_end|>9.8 and 9.11, which is bigger?<|im_end|>",
   "max_tokens":128, "temperature":0}'
 ```
 
-`run_server.sh` wraps the launch above (env vars `NUM_PAGES`, `GRAPH_BS` override KV size and
-CUDA-graph batch size). `--cache-type naive` is required: radix prefix-sharing is incorrect under
-the PrefixLM bidirectional prefill.
+`--cache-type naive` is required: radix prefix-sharing is incorrect under the PrefixLM
+bidirectional prefill. `test_openai_sdk.py` exercises the SDK round-trip.
 
 ### Notes
 
