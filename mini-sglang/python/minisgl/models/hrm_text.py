@@ -149,8 +149,12 @@ class HrmModel(BaseOP):
         self._H_cycles = config.H_cycles
         self._L_cycles = config.L_cycles
         self._num_layers_per_stack = config.num_layers_per_stack
+        self._compiled_forward = torch.compile(self._forward_impl, mode="reduce-overhead")
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self._compiled_forward(input_ids)
+
+    def _forward_impl(self, input_ids: torch.Tensor) -> torch.Tensor:
         # z_H: slow / high-level state. z_L: fast / low-level state (init = 0).
         z_H = self.embed_tokens.forward(input_ids) * self._embedding_scale
         z_L = torch.zeros_like(z_H)
