@@ -57,7 +57,7 @@ def _sigmoid_mul(gate: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         x.stride(0),
         out.stride(0),
         BLOCK=1024,
-        num_warps=4,
+        num_warps=1,
     )
     return out
 
