@@ -99,7 +99,7 @@ def _state_add_rmsnorm(state: torch.Tensor, update: torch.Tensor, eps: float) ->
         out.stride(0),
         eps,
         BLOCK=2048,
-        num_warps=8,
+        num_warps=4,
     )
     return out
 
