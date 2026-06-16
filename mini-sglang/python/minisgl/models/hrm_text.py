@@ -117,7 +117,7 @@ def _residual_add_rmsnorm(
         x.stride(0),
         eps,
         BLOCK=2048,
-        num_warps=8,
+        num_warps=4,
     )
     return x, residual
 
