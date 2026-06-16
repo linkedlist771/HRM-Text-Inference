@@ -180,7 +180,7 @@ def _rope_store_kv(
         n_elems,
         HEAD_DIM=head_dim,
         HALF=head_dim // 2,
-        num_warps=2,
+        num_warps=1,
     )
 
 
