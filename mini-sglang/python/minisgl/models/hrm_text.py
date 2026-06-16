@@ -151,6 +151,10 @@ class HrmModel(BaseOP):
         self._H_cycles = config.H_cycles
         self._L_cycles = config.L_cycles
         self._num_layers_per_stack = config.num_layers_per_stack
+        self._L_layers = self.L_module.layers.op_list
+        self._H_layers = self.H_module.layers.op_list
+        self._L_final_norm = self.L_module.final_norm
+        self._H_final_norm = self.H_module.final_norm
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # z_H: slow / high-level state. z_L: fast / low-level state (init = 0).
@@ -161,9 +165,15 @@ class HrmModel(BaseOP):
         for h in range(self._H_cycles):
             for l in range(self._L_cycles):
                 offset = (h * (self._L_cycles + 1) + l) * nps
-                z_L = self.L_module.forward(z_L + z_H, offset)
+                z_L = z_L + z_H
+                for layer in self._L_layers:
+                    z_L = layer.forward(z_L, offset)
+                z_L = self._L_final_norm.forward(z_L)
             offset = (h * (self._L_cycles + 1) + self._L_cycles) * nps
-            z_H = self.H_module.forward(z_H + z_L, offset)
+            z_H = z_H + z_L
+            for layer in self._H_layers:
+                z_H = layer.forward(z_H, offset)
+            z_H = self._H_final_norm.forward(z_H)
         return z_H
 
 
